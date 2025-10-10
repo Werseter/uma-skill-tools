@@ -9,7 +9,7 @@ export interface HpPolicy {
 	tick(state: RaceState, dt: number): void
 	hasRemainingHp(): boolean
 	hpRatioRemaining(): number  // separate methods as the former can be much cheaper to check
-	recover(modifier: number): void
+	recover(modifier: number, state?: RaceState): void
 	getLastSpurtPair(state: RaceState, maxSpeed: number, baseTargetSpeed2: number): [number, number]
 }
 
@@ -18,7 +18,7 @@ export const NoopHpPolicy: HpPolicy = {
 	tick(_0: RaceState, _1: number) {},
 	hasRemainingHp() { return true; },
 	hpRatioRemaining() { return 1.0; },
-	recover(_: number) {},
+	recover(_: number, _state?: RaceState) {},
 	getLastSpurtPair(_0: RaceState, maxSpeed: number, _1: number) { return [-1, maxSpeed] as [number, number]; }
 }
 
@@ -38,6 +38,7 @@ export class GameHpPolicy {
 	gutsModifier: number
 	subparAcceptChance: number
 	rng: PRNG
+	private achievedMaxSpurt: boolean = false
 
 	constructor(course: CourseData, ground: GroundCondition, rng: PRNG) {
 		this.distance = course.distance;
@@ -47,6 +48,7 @@ export class GameHpPolicy {
 		this.maxHp = 1.0;  // the first round of skill activations happens before init() is called (so we can get the correct stamina after greens)
 		this.hp = 1.0;     // but there are some conditions that access HpPolicy methods which can run in the first round (e.g. is_hp_empty_onetime)
 		                   // so we have to be "initialized enough" for them
+		this.achievedMaxSpurt = false;
 	}
 
 	init(horse: HorseParameters) {
@@ -54,18 +56,25 @@ export class GameHpPolicy {
 		this.hp = this.maxHp;
 		this.gutsModifier = 1.0 + 200.0 / Math.sqrt(600.0 * horse.guts);
 		this.subparAcceptChance = Math.round((15.0 + 0.05 * horse.wisdom) * 1000);
+		this.achievedMaxSpurt = false; // Reset for each race
 	}
 
-	getStatusModifier(state: {isPaceDown: boolean}) {
+	getStatusModifier(state: {isPaceDown: boolean, isRushed?: boolean, isDownhillMode?: boolean}) {
 		let modifier = 1.0;
 		if (state.isPaceDown) {
 			modifier *= 0.6;
 		}
-		// TODO downhill mode
+		if (state.isRushed) {
+			modifier *= 1.6;
+		}
+		if (state.isDownhillMode) {
+			// Downhill accel mode reduces HP consumption by 60%
+			modifier *= 0.4;
+		}
 		return modifier;
 	}
 
-	hpPerSecond(state: {phase: Phase, isPaceDown: boolean}, velocity: number) {
+	hpPerSecond(state: {phase: Phase, isPaceDown: boolean, isRushed?: boolean, isDownhillMode?: boolean}, velocity: number) {
 		const gutsModifier = state.phase >= 2 ? this.gutsModifier : 1.0;
 		return 20.0 * Math.pow(velocity - this.baseSpeed + 12.0, 2) / 144.0 *
 			this.getStatusModifier(state) * this.groundModifier * gutsModifier;
@@ -85,7 +94,7 @@ export class GameHpPolicy {
 		return Math.max(0.0, this.hp / this.maxHp);
 	}
 
-	recover(modifier: number) {
+	recover(modifier: number, _state?: RaceState) {
 		this.hp = Math.min(this.maxHp, this.hp + this.maxHp * modifier);
 	}
 
@@ -93,7 +102,14 @@ export class GameHpPolicy {
 		const maxDist = this.distance - CourseHelpers.phaseStart(this.distance, 2);
 		const s = (maxDist - 60) / maxSpeed;
 		const lastleg = {phase: 2 as Phase, isPaceDown: false};
-		if (this.hp >= this.hpPerSecond(lastleg, maxSpeed) * s) {
+		const hpNeeded = this.hpPerSecond(lastleg, maxSpeed) * s;
+		
+		if (this.hp >= hpNeeded) {
+			// Only set on first call (when not already set)
+			// This matches Kotlin behavior: track initial decision, not later changes
+			if (!this.achievedMaxSpurt) {
+				this.achievedMaxSpurt = true;
+			}
 			return [-1, maxSpeed] as [number, number];
 		}
 		const candidates: [number, number][] = [];
@@ -117,11 +133,24 @@ export class GameHpPolicy {
 		candidates.sort((a,b) =>
 			((a[0] - state.pos) / baseTargetSpeed2 + (this.distance - a[0]) / a[1]) -
 			((b[0] - state.pos) / baseTargetSpeed2 + (this.distance - b[0]) / b[1]));
+		
+		// PRE-ROLL the random value to ensure fixed RNG consumption
+		// This guarantees both horses in a comparison consume exactly 1 RNG call,
+		// preventing desynchronization of the random number streams
+		const randomRoll = this.rng.uniform(100000);
+		
 		for (let i = 0; i < candidates.length; ++i) {
-			if (this.rng.uniform(100000) <= this.subparAcceptChance) {
+			if (randomRoll <= this.subparAcceptChance) {
 				return candidates[i];
 			}
 		}
 		return candidates[candidates.length-1];
+	}
+	
+	/**
+	 * Check if max spurt was achieved
+	 */
+	isMaxSpurt(): boolean {
+		return this.achievedMaxSpurt;
 	}
 }

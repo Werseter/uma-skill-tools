@@ -63,6 +63,7 @@ namespace Acceleration {
 const BaseAccel = 0.0006;
 const UphillBaseAccel = 0.0004;
 
+
 function baseAccel(baseAccel: number, horse: HorseParameters, phase: Phase) {
 	return baseAccel * Math.sqrt(500.0 * horse.power) *
 	  Acceleration.StrategyPhaseCoefficient[horse.strategy][phase] *
@@ -121,6 +122,7 @@ export interface RaceState {
 	readonly lastSpurtSpeed: number
 	readonly lastSpurtTransition: number
 	readonly isPaceDown: boolean
+	readonly isDownhillMode: boolean
 	readonly phase: Phase
 	readonly pos: number
 	readonly hp: Readonly<HpPolicy>
@@ -199,6 +201,7 @@ export class RaceSolver {
 	rng: PRNG
 	gorosiRng: PRNG
 	paceEffectRng: PRNG
+	posKeepRng: PRNG
 	timers: Timer[]
 	startDash: boolean
 	startDelay: number
@@ -232,6 +235,33 @@ export class RaceSolver {
 	posKeepEffectStart: number
 	posKeepEffectExitDistance: number
 	updatePositionKeep: () => void
+	
+	// Rushed state
+	isRushed: boolean
+	hasBeenRushed: boolean  // Track if horse has already been rushed this race (can only happen once)
+	rushedSection: number  // Which section (2-9) the rushed state activates in
+	rushedEnterPosition: number  // Position where rushed state should activate
+	rushedTimer: Timer  // Tracks time in rushed state
+	rushedMaxDuration: number  // Maximum duration (12s + extensions)
+	rushedActivations: Array<[number, number]>  // Track [start, end] positions for UI
+
+	//Front Runner 
+	isFrontRunnerSpeedUpMode: boolean
+	FrontRunnerSpeedUpModifier: number
+	FrontRunnerSpeedUpExitDistance: number
+	FrontRunnerOverTakeExistDistance: number
+	FrontRunnerSpeedUpTimer: Timer
+	FrontRunnerOverTakeMode: boolean
+	speedUpProbability: number  // 0-100, probability of entering speed-up mode
+	
+	//downhill mode
+	isDownhillMode: boolean
+	disableDownhill: boolean
+	downhillModeStart: number | null  // Frame when downhill mode started
+	lastDownhillCheckFrame: number  // Last frame we checked for downhill mode changes
+
+	//skill check chance
+	skillCheckChance: boolean
 
 	modifiers: {
 		targetSpeed: CompensatedAccumulator
@@ -249,7 +279,11 @@ export class RaceSolver {
 		hp: HpPolicy,
 		pacer?: RaceSolver,
 		onSkillActivate?: (s: RaceSolver, skillId: string) => void,
-		onSkillDeactivate?: (s: RaceSolver, skillId: string) => void
+		onSkillDeactivate?: (s: RaceSolver, skillId: string) => void,
+		disableRushed?: boolean,
+		disableDownhill?: boolean,
+		speedUpProbability?: number,
+		skillCheckChance?: boolean
 	}) {
 		// clone since green skills may modify the stat values
 		this.horse = Object.assign({}, params.horse);
@@ -262,6 +296,7 @@ export class RaceSolver {
 		this.usedSkills = new Set();
 		this.gorosiRng = new Rule30CARng(this.rng.int32());
 		this.paceEffectRng = new Rule30CARng(this.rng.int32());
+		this.posKeepRng = new Rule30CARng(this.rng.int32());
 		this.timers = [];
 		this.accumulatetime = this.getNewTimer();
 		// bit of a hack because implementing post_number is surprisingly annoying, since we don't have RaceParameters.numUmas available here
@@ -293,10 +328,37 @@ export class RaceSolver {
 		this.posKeepEnd = this.sectionLength * 5.0;
 		this.posKeepSpeedCoef = 1.0;
 		if (StrategyHelpers.strategyMatches(this.horse.strategy, Strategy.Nige) || this.pacer == null) {
-			this.updatePositionKeep = noop as any;
+			this.updatePositionKeep = this.updatePositionKeepNige;
+			console.log("Uma is Nige or has no pacer, using Nige position keep logic");
+			//this.updatePositionKeep = noop as any; 
+			//fuck that shit!!!
 		} else {
 			this.updatePositionKeep = this.updatePositionKeepNonNige;
 		}
+
+		//init timer
+		this.FrontRunnerSpeedUpTimer = this.getNewTimer(0.0)
+		this.speedUpProbability = params.speedUpProbability != null ? params.speedUpProbability : 100
+		
+		// Initialize rushed state
+		this.isRushed = false;
+		this.hasBeenRushed = false;
+		this.rushedSection = -1;
+		this.rushedEnterPosition = -1;
+		this.rushedTimer = this.getNewTimer();
+		this.rushedMaxDuration = 12.0;
+		
+		// Initialize downhill mode
+		this.isDownhillMode = false;
+		this.disableDownhill = params.disableDownhill || false;
+		this.downhillModeStart = null;
+		this.lastDownhillCheckFrame = 0;
+		
+		// Initialize skill check chance
+		this.skillCheckChance = params.skillCheckChance !== false; // Default to true
+		this.rushedActivations = [];
+		// Calculate rushed chance and determine if/when it activates
+		this.initRushedState(params.disableRushed || false);
 
 		this.modifiers = {
 			targetSpeed: new CompensatedAccumulator(0.0),
@@ -354,7 +416,8 @@ export class RaceSolver {
 		this.hillEnd = this.course.slopes.map(s => s.start + s.length).reverse();
 		this.hillIdx = -1;
 		if (this.hillStart.length > 0 && this.hillStart[this.hillStart.length - 1] == 0) {
-			if (this.course.slopes[0].slope > 0) {
+			// Only set hillIdx for uphills with >1.0% grade
+			if (this.course.slopes[0].slope > 100) {
 				this.hillIdx = 0;
 			} else {
 				this.hillEnd.pop();
@@ -367,6 +430,68 @@ export class RaceSolver {
 		const tm = new Timer(t);
 		this.timers.push(tm);
 		return tm;
+	}
+	
+	initRushedState(disabled: boolean) {
+		// Skip rushed calculation if disabled
+		if (disabled) {
+			return;
+		}
+		
+		// Calculate rushed chance based on wisdom
+		// Formula: RushedChance = (6.5 / log10(0.1 * WizStat + 1))²%
+		const wisdomStat = this.horse.wisdom;
+		const rushedChance = Math.pow(6.5 / Math.log10(0.1 * wisdomStat + 1), 2) / 100;
+		
+		// Check if horse has 自制心 (Self-Control) skill - ID 202161
+		// This reduces rushed chance by flat 3%
+		const hasSelfControl = this.pendingSkills.some(s => s.skillId === '202161');
+		const finalRushedChance = Math.max(0, rushedChance - (hasSelfControl ? 0.03 : 0));
+		
+		// Roll for rushed state
+		if (this.rng.random() < finalRushedChance) {
+			// Determine which section (2-9) the rushed state activates in
+			this.rushedSection = 2 + this.rng.uniform(8);  // Random int from 2 to 9
+			this.rushedEnterPosition = this.sectionLength * this.rushedSection;
+		}
+	}
+	
+	updateRushedState() {
+		// Check if we should enter rushed state (can only happen once per race)
+		if (this.rushedSection >= 0 && !this.isRushed && !this.hasBeenRushed && this.pos >= this.rushedEnterPosition) {
+			this.isRushed = true;
+			this.hasBeenRushed = true;  // Mark that this horse has been rushed
+			this.rushedTimer.t = 0;
+			this.rushedActivations.push([this.pos, -1]);  // Start tracking, end will be filled later
+		}
+		
+		// Update rushed state if active
+		if (this.isRushed) {
+			// Check for recovery every 3 seconds
+			if (this.rushedTimer.t > 0 && Math.floor(this.rushedTimer.t / 3) > Math.floor((this.rushedTimer.t - 0.017) / 3)) {
+				// 55% chance to snap out of it
+				if (this.rng.random() < 0.55) {
+					this.endRushedState();
+					return;
+				}
+			}
+			
+			// Force end after max duration
+			if (this.rushedTimer.t >= this.rushedMaxDuration) {
+				this.endRushedState();
+			}
+		}
+	}
+	
+	endRushedState() {
+		this.isRushed = false;
+		// Mark the end position for UI display
+		if (this.rushedActivations.length > 0) {
+			const lastIdx = this.rushedActivations.length - 1;
+			if (this.rushedActivations[lastIdx][1] === -1) {
+				this.rushedActivations[lastIdx][1] = this.pos;
+			}
+		}
 	}
 
 	getMaxSpeed() {
@@ -417,6 +542,8 @@ export class RaceSolver {
 		this.timers.forEach(tm => tm.t += dt);
 		this.updateHills();
 		this.updatePhase();
+		this.updateRushedState();
+		this.updateDownhillMode();
 		this.processSkillActivations();
 		this.updatePositionKeep();
 		this.updateLastSpurtState();
@@ -463,6 +590,59 @@ export class RaceSolver {
 		}
 	}
 
+	updatePositionKeepNige(){
+		//assign exit distance and speedup mode chance according to the race docs
+		const secondPlaceUmaPos = this.pacer ? this.pacer.pos : this.pos - 5.0 
+		const isFirstPlace = (this.pacer == null || this.pos > this.pacer.pos);
+		this.isFrontRunnerSpeedUpMode = false
+		this.FrontRunnerSpeedUpTimer.t = -1.0 // I fucking hate you compiler and I hope you get run over by a train
+		
+		this.FrontRunnerSpeedUpExitDistance = StrategyHelpers.strategyMatches(this.horse.strategy, Strategy.Oonige) ? 12.5 : 4.5;
+
+		
+		//logic for frontRunner SpeedUp mode
+		if(this.isFrontRunnerSpeedUpMode){
+			
+			
+			if(this.pos - secondPlaceUmaPos >= this.FrontRunnerSpeedUpExitDistance){
+				this.isFrontRunnerSpeedUpMode = false;
+				this.posKeepSpeedCoef = 1.0;
+				this.FrontRunnerSpeedUpTimer.t = 5.0;
+			}
+
+			
+		} else if(this.FrontRunnerSpeedUpTimer.t >= 0){
+			
+			if (isFirstPlace && this.pos - secondPlaceUmaPos < this.FrontRunnerSpeedUpExitDistance && this.rollthisSHIT()){
+				this.isFrontRunnerSpeedUpMode = true;
+				this.posKeepSpeedCoef = 1.04;
+			}
+		}
+
+
+		//logic for overtake mode (HELLA INNACURATE BECAUSE WE CANT TRACK WHERE EACH UMA IS!!!)
+		if(this.FrontRunnerOverTakeMode){
+			const secondPlaceStratPos = this.pos - 10.0 
+			if(this.pos - secondPlaceStratPos >= this.FrontRunnerOverTakeExistDistance){
+				this.FrontRunnerOverTakeMode = true;
+				this.posKeepSpeedCoef = 1.05;
+			}
+		}
+
+		//conclusion - this isn't even a race sim.... 
+	}
+	
+
+	//helper function I made for no reason but it has a cool name
+	//WIT CHECK!!! + Speed-up probability check
+	rollthisSHIT(): boolean {
+		const witCheck = 20 * Math.log10(0.1 * this.horse.wisdom)
+		const passedWisdomCheck = (this.posKeepRng.random() * 100) < witCheck
+		const passedSpeedUpCheck = (this.posKeepRng.random() * 100) < this.speedUpProbability
+		return passedWisdomCheck && passedSpeedUpCheck
+	
+	}
+
 	updateLastSpurtState() {
 		if (this.isLastSpurt || this.phase < 2) return;
 		if (this.lastSpurtTransition == -1) {
@@ -472,6 +652,46 @@ export class RaceSolver {
 		}
 		if (this.pos >= this.lastSpurtTransition) {
 			this.isLastSpurt = true;
+		}
+	}
+
+	updateDownhillMode() {
+		// Check if we should update downhill mode (once per second, at 15 FPS)
+		const currentFrame = Math.floor(this.accumulatetime.t * 15);
+		const changeSecond = currentFrame % 15 === 14; // Check on the last frame of each second
+		
+		if (!changeSecond || currentFrame === this.lastDownhillCheckFrame) {
+			return; // Not time to check yet, or already checked this second
+		}
+		
+		this.lastDownhillCheckFrame = currentFrame;
+		
+		// Check if we're on a downhill slope
+		const currentSlope = this.course.slopes.find(s => this.pos >= s.start && this.pos <= s.start + s.length);
+		const isOnDownhill = currentSlope && currentSlope.slope < -1; // Only on downhills with >1.0% grade
+		
+		
+		if (!this.disableDownhill && isOnDownhill) {
+			if (this.downhillModeStart === null) {
+				// Check for entry: Wisdom * 0.0004 chance each second (matching Kotlin implementation)
+				console.log(this.rng.random() < this.horse.wisdom * 0.0004)
+				if (this.rng.random() < this.horse.wisdom * 0.0004) {
+					this.downhillModeStart = currentFrame;
+					this.isDownhillMode = true;
+				}
+			} else {
+				// Check for exit: 20% chance each second to exit downhill mode
+				if (this.rng.random() < 0.2) {
+					this.downhillModeStart = null;
+					this.isDownhillMode = false;
+				}
+			}
+		} else {
+			// Not on a downhill slope, exit downhill mode immediately
+			if (this.isDownhillMode) {
+				this.downhillModeStart = null;
+				this.isDownhillMode = false;
+			}
 		}
 	}
 
@@ -491,6 +711,17 @@ export class RaceSolver {
 			this.targetSpeed -= this.course.slopes[this.hillIdx].slope / 10000.0 * 200.0 / this.horse.power;
 			this.targetSpeed = Math.max(this.targetSpeed, this.minSpeed);
 		}
+
+		// moved logic on every step
+		// We need to check the isDownhill every frame so we actually get the speed boost
+		if (this.isDownhillMode) {
+			const currentSlope = this.course.slopes.find(s => this.pos >= s.start && this.pos <= s.start + s.length);
+			if (currentSlope) {
+				console.log("Current slope value: ", currentSlope.slope)
+				const downhillBonus = 0.3 + (Math.abs(currentSlope.slope/10000) / 10.0);
+				this.targetSpeed += downhillBonus;
+			}
+		}
 	}
 
 	applyForces() {
@@ -508,7 +739,8 @@ export class RaceSolver {
 
 	updateHills() {
 		if (this.hillIdx == -1 && this.hillStart.length > 0 && this.pos >= this.hillStart[this.hillStart.length - 1]) {
-			if (this.course.slopes[this.nHills - this.hillStart.length].slope > 0) {
+			// Only set hillIdx for uphills with >1.0% grade (slope > 100, where SlopePer = slope/100)
+			if (this.course.slopes[this.nHills - this.hillStart.length].slope > 100) {
 				this.hillIdx = this.nHills - this.hillStart.length;
 			} else {
 				this.hillEnd.pop();
@@ -565,11 +797,23 @@ export class RaceSolver {
 				this.pendingSkills.splice(i,1);
 				this.pendingRemoval.delete(s.skillId);
 			} else if (this.pos >= s.trigger.start && s.extraCondition(this)) {
+				// Check wisdom for skill activation if enabled
+				if (this.skillCheckChance && !this.checkWisdomForSkill(s)) {
+					// Skill fails due to low wisdom
+					this.pendingSkills.splice(i,1);
+				} else {
 				this.activateSkill(s);
 				this.pendingSkills.splice(i,1);
+				}
 			}
 		}
 	}
+
+	checkWisdomForSkill(skill: PendingSkill): boolean {
+		// Check if horse's wisdom meets the requirement
+		return this.rng.random() <= Math.max(100-9000/this.horse.wisdom,20) * 0.01;
+	}
+
 
 	activateSkill(s: PendingSkill) {
 		// sort so that the ExtendEvolvedDuration effect always activates after other effects, since it shouldn't extend the duration of other
@@ -619,7 +863,8 @@ export class RaceSolver {
 				break;
 			case SkillType.Recovery:
 				++this.activateCountHeal;
-				this.hp.recover(ef.modifier);
+				// Pass state to recover for dynamic spurt recalculation in accuracy mode
+				this.hp.recover(ef.modifier, this);
 				if (!CC_GLOBAL && this.phase >= 2 && !this.isLastSpurt) {
 					this.updateLastSpurtState();
 				}
