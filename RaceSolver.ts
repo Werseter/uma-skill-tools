@@ -702,8 +702,8 @@ export class RaceSolver {
 			this.targetSpeed = this.lastSpurtSpeed;
 		} else {
 			this.targetSpeed = this.baseTargetSpeed[this.phase] * this.posKeepSpeedCoef;
+			this.targetSpeed += this.sectionModifier[Math.floor(this.pos / this.sectionLength)];
 		}
-		this.targetSpeed += this.sectionModifier[Math.floor(this.pos / this.sectionLength)];
 		this.targetSpeed += this.modifiers.targetSpeed.acc + this.modifiers.targetSpeed.err;
 
 		if (this.hillIdx != -1) {
