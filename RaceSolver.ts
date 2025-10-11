@@ -469,6 +469,8 @@ export class RaceSolver {
 		if (this.isRushed) {
 			// Check for recovery every 3 seconds
 			if (this.rushedTimer.t > 0 && Math.floor(this.rushedTimer.t / 3) > Math.floor((this.rushedTimer.t - 0.017) / 3)) {
+				console.log("Horse HP rushed into:", this.hp)
+				
 				// 55% chance to snap out of it
 				if (this.rng.random() < 0.55) {
 					this.endRushedState();
