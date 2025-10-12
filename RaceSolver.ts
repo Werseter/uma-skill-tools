@@ -645,6 +645,8 @@ export class RaceSolver {
 	
 	}
 
+	
+
 	updateLastSpurtState() {
 		if (this.isLastSpurt || this.phase < 2) return;
 		if (this.lastSpurtTransition == -1) {

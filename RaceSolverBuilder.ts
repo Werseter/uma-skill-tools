@@ -684,7 +684,7 @@ export class RaceSolverBuilder {
 		return this;
 	}
 
-	useEnhancedSpurt(enabled: boolean = true) {
+	useEnhancedSpurt(enabled: boolean = false) {
 		this._useEnhancedSpurt = enabled;
 		return this;
 	}
