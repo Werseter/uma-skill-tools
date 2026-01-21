@@ -260,8 +260,6 @@ export class RaceSolver {
 	downhillModeStart: number | null  // Frame when downhill mode started
 	lastDownhillCheckFrame: number  // Last frame we checked for downhill mode changes
 
-
-
 	//skill check chance
 	skillCheckChance: boolean
 
@@ -407,7 +405,6 @@ export class RaceSolver {
 		this.baseAccel = ([0,1,2,0,1,2] as Phase[]).map((phase,i) => baseAccel(i > 2 ? UphillBaseAccel : BaseAccel, this.horse, phase));
 	}
 
-
 	initHills() {
 		// note that slopes are not always sorted by start location in course_data.json
 		// sometimes (?) they are sorted by hill type and then by start
@@ -472,8 +469,6 @@ export class RaceSolver {
 		if (this.isRushed) {
 			// Check for recovery every 3 seconds
 			if (this.rushedTimer.t > 0 && Math.floor(this.rushedTimer.t / 3) > Math.floor((this.rushedTimer.t - 0.017) / 3)) {
-				console.log("Horse HP rushed into:", this.hp)
-				
 				// 55% chance to snap out of it
 				if (this.rng.random() < 0.55) {
 					this.endRushedState();
@@ -562,8 +557,6 @@ export class RaceSolver {
 			this.modifiers.accel.add(-24.0);
 		}
 		this.modifiers.oneFrameAccel = 0.0;
-		const distanceToPacer = this.pacer ? this.pacer.pos - this.pos : 0;
-
 	}
 
 	updatePositionKeepNonNige() {
@@ -649,8 +642,6 @@ export class RaceSolver {
 		return passedWisdomCheck && passedSpeedUpCheck
 	
 	}
-
-	
 
 	updateLastSpurtState() {
 		if (this.isLastSpurt || this.phase < 2) return;
