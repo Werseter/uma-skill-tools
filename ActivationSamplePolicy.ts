@@ -162,7 +162,11 @@ export class ErlangRandomPolicy extends DistributionRandomPolicy {
 		// matter if that actually obeys the distribution or not.
 		// note that this isn't really a problem for LogNormalRandomPolicy since it always generates at least two numbers. granted, that will
 		// probably result in some fairly odd results, but that's not really a big deal.
-		const range = nsamples == 1 ? 18 : max - min;
+		if (nsamples == 1) {
+			const scale = 18;
+			return nums.map(n => Math.floor(upper * Math.min(n / scale, 1.0)));
+		}
+		const range = max - min;
 		return nums.map(n => Math.floor(upper * (n - min) / range));
 	}
 }
@@ -225,3 +229,28 @@ export const AllCornerRandomPolicy = Object.freeze({
 	reconcileStraightRandom(_: ActivationSamplePolicy) { throw new Error('cannot reconcile StraightRandomPolicy with AllCornerRandomPolicy'); },
 	reconcileAllCornerRandom(_: ActivationSamplePolicy) { return this; }
 });
+
+/**
+ * Creates a fixed position sample policy that forces a skill to activate at a specific distance.
+ * This ignores the skill's normal activation conditions and places the trigger at the exact position specified.
+ * @param position The distance (in meters) where the skill should activate
+ * @returns An ActivationSamplePolicy that always triggers at the specified position
+ */
+export function createFixedPositionPolicy(position: number): ActivationSamplePolicy {
+	return Object.freeze({
+		sample(_regions: RegionList, nsamples: number, _rng: PRNG) {
+			// Always return the same fixed position for all samples
+			const samples = [];
+			for (let i = 0; i < nsamples; ++i) {
+				samples.push(new Region(position, position + 10));
+			}
+			return samples;
+		},
+		reconcile(_other: ActivationSamplePolicy) { return this; },
+		reconcileImmediate(_: ActivationSamplePolicy) { return this; },
+		reconcileDistributionRandom(_: ActivationSamplePolicy) { return this; },
+		reconcileRandom(_: ActivationSamplePolicy) { return this; },
+		reconcileStraightRandom(_: ActivationSamplePolicy) { return this; },
+		reconcileAllCornerRandom(_: ActivationSamplePolicy) { return this; }
+	});
+}
